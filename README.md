@@ -47,14 +47,7 @@ A low-cost wearable that detects back-sleeping (supine position), gently vibrate
 
 ---
 
-## 1 · Try the dashboard (no setup)
-
-Open the GitHub Pages link of this repo, or open `dashboard/index.html` locally.
-With no database configured it runs a **built-in simulator** (demo mode) that walks through the full therapy cycle: dark → delay → side → back → nudge → turn → buzzer escalation.
-
----
-
-## 2 · Create the Firebase backend (free Spark plan, ~5 min)
+## 1 · Create the Firebase backend (free Spark plan, ~5 min)
 
 1. Go to <https://console.firebase.google.com> → **Add project** (Analytics not needed).
 2. **Build → Realtime Database → Create database** → pick a location → start in **locked mode**.
@@ -66,7 +59,7 @@ With no database configured it runs a **built-in simulator** (demo mode) that wa
 
 ---
 
-## 3 · Configure and flash the ESP32
+## 2 · Configure and flash the ESP32
 
 1. Arduino IDE → Boards Manager → **esp32 by Espressif (3.x)** · board **DOIT ESP32 DEVKIT V1**.
 2. Libraries: *Adafruit MPU6050*, *Adafruit Unified Sensor*, *SparkFun MAX3010x*, *DHT sensor library*.
@@ -75,7 +68,7 @@ With no database configured it runs a **built-in simulator** (demo mode) that wa
    const char* WIFI_SSID     = "your-wifi";      // 2.4 GHz only (phone hotspot works)
    const char* WIFI_PASS     = "password";
    const char* FIREBASE_URL  = "https://...firebasedatabase.app";  // no trailing slash
-   const char* FIREBASE_AUTH = "database secret from step 2.5";
+   const char* FIREBASE_AUTH = "database secret from step 1.5";
    ```
 4. Upload (hold **BOOT** if it says *Connecting…*). Serial Monitor @ 115200 shows `[HTTP] PUT /devices/spt01/live -> 200`.
 
@@ -84,18 +77,18 @@ With no database configured it runs a **built-in simulator** (demo mode) that wa
 
 ---
 
-## 4 · Connect the dashboard
+## 3 · Connect the dashboard
 
 Either
+- open the dashboard → enter the URL on the **Connect a device** screen (saved in that browser), **or**
 - edit `dashboard/config.js` → `databaseURL: "https://..."` and push (GitHub Pages redeploys), **or**
-- open the dashboard → **Settings** → paste the URL → *Connect* (saved in that browser), **or**
 - use a link: `…/index.html?db=https://...firebasedatabase.app&device=spt01`
 
 The status pill shows **Live** while the device uploads, and **Device offline** if `/live` is older than 30 s.
 
 ---
 
-## 5 · Test without hardware (simulator)
+## 4 · Testing the cloud path without hardware (optional)
 
 ```bash
 cd backend/simulator
@@ -103,7 +96,7 @@ FIREBASE_URL="https://...firebasedatabase.app" FIREBASE_AUTH="secret" node simul
 # --seed   also writes 7 nights of reports + 1 h history
 # --clear  deletes /devices/spt01
 ```
-Requires Node 18+, no `npm install`.
+Writes the same JSON format as the ESP32, for checking the database and dashboard before the device is online. Requires Node 18+, no `npm install`. Run `--clear` afterwards to remove the test records.
 
 ---
 
