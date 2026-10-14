@@ -7,7 +7,7 @@
  * Cloud     : Firebase Realtime Database over HTTPS (REST)
  *
  * Board package: esp32 by Espressif, core 3.x  (uses ledcAttach / ledcWrite(pin, duty))
- * Libraries    : Adafruit MPU6050, Adafruit Unified Sensor, SparkFun MAX3010x, DHT sensor library
+ * Libraries    : Adafruit MPU6050, Adafruit Unified Sensor, SparkFun MAX3010x (only MAX30105.h is used), DHT sensor library
  * Verified    : compiles for "DOIT ESP32 DEVKIT V1" with esp32 core 3.3.12 (83% flash)
  */
 #include <Wire.h>
@@ -18,7 +18,6 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include "MAX30105.h"
-#include "spo2_algorithm.h"
 #include <DHT.h>
 
 // ---------------- Pin map ----------------
@@ -179,6 +178,48 @@ int recentSnores() {
   return n;
 }
 
+// Heart rate + SpO2 from raw IR / red samples (self-contained, no extra library file needed).
+// HR  : peaks of the detrended IR (pulse) signal, at least 0.33 s apart.
+// SpO2: "ratio of ratios" R = (AC_red/DC_red) / (AC_ir/DC_ir), SpO2 ~ 110 - 25*R.
+void calcHrSpo2(const uint32_t* ir, const uint32_t* red, int n, float fs,
+                int32_t* hr, int8_t* hrValid, int32_t* spo2, int8_t* spo2Valid) {
+  *hrValid = 0; *spo2Valid = 0;
+  float dcIr = 0, dcRed = 0;
+  for (int i = 0; i < n; i++) { dcIr += ir[i]; dcRed += red[i]; }
+  dcIr /= n; dcRed /= n;
+  static float ac[100];
+  float acIr = 0, acRed = 0;
+  const int W = 4;                                   // moving-average window removes slow drift
+  for (int i = 0; i < n; i++) {
+    float m = 0; int c = 0;
+    for (int k = i - W; k <= i + W; k++) if (k >= 0 && k < n) { m += ir[k]; c++; }
+    float base = 0; int cb = 0;
+    for (int k = i - 12; k <= i + 12; k++) if (k >= 0 && k < n) { base += ir[k]; cb++; }
+    ac[i] = (m / c) - (base / cb);
+    acIr += ((float)ir[i] - dcIr) * ((float)ir[i] - dcIr);
+    acRed += ((float)red[i] - dcRed) * ((float)red[i] - dcRed);
+  }
+  acIr = sqrtf(acIr / n); acRed = sqrtf(acRed / n);
+  // peaks
+  float thr = 0; for (int i = 0; i < n; i++) thr += fabsf(ac[i]); thr = thr / n * 0.6f;
+  int minGap = (int)(fs * 0.33f), first = -1, last = -1, peaks = 0, prev = -1000;
+  for (int i = 1; i < n - 1; i++) {
+    if (ac[i] > thr && ac[i] >= ac[i - 1] && ac[i] > ac[i + 1] && i - prev >= minGap) {
+      if (first < 0) first = i; last = i; peaks++; prev = i;
+    }
+  }
+  if (peaks >= 2 && last > first) {
+    float bpm = (peaks - 1) * 60.0f * fs / (last - first);
+    if (bpm >= 40 && bpm <= 180) { *hr = (int32_t)(bpm + 0.5f); *hrValid = 1; }
+  }
+  if (dcIr > 0 && dcRed > 0 && acIr > 0) {
+    float R = (acRed / dcRed) / (acIr / dcIr);
+    float v = 110.0f - 25.0f * R;
+    if (v > 100) v = 100;
+    if (v >= 70) { *spo2 = (int32_t)(v + 0.5f); *spo2Valid = 1; }
+  }
+}
+
 void readPPG() {
   if (!ppgOk) return;
   const int N = 100;
@@ -190,7 +231,7 @@ void readPPG() {
   }
   if (ir[N - 1] < 50000) { Serial.println("[PPG] no finger detected"); return; }
   int32_t spo2, hr; int8_t vs, vh;
-  maxim_heart_rate_and_oxygen_saturation(ir, N, red, &spo2, &vs, &hr, &vh);
+  calcHrSpo2(ir, red, N, 25.0f, &hr, &vh, &spo2, &vs);   // 100 Hz with 4-sample averaging = 25 samples/s
   if (vs) { lastSpo2 = spo2; if (spo2 < minSpo2) minSpo2 = spo2; }
   if (vh) lastHR = hr;
   if (vs && spo2 < 90) logEvent("spo2_dip", String(spo2) + "%");
