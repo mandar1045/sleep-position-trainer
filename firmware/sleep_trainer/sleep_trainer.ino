@@ -7,7 +7,8 @@
  * Cloud     : Firebase Realtime Database over HTTPS (REST)
  *
  * Board package: esp32 by Espressif, core 3.x  (uses ledcAttach / ledcWrite(pin, duty))
- * Libraries    : Adafruit MPU6050, Adafruit Unified Sensor, SparkFun MAX3010x (only MAX30105.h is used), DHT sensor library
+ * Libraries    : Adafruit MPU6050, Adafruit Unified Sensor, DHT sensor library
+ *                (MAX30102 is driven directly over I2C – no MAX3010x library needed)
  * Verified    : compiles for "DOIT ESP32 DEVKIT V1" with esp32 core 3.3.12 (83% flash)
  */
 #include <Wire.h>
@@ -17,7 +18,6 @@
 #include <time.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include "MAX30105.h"
 #include <DHT.h>
 
 // ---------------- Pin map ----------------
@@ -50,7 +50,6 @@ const bool  REQUIRE_SNORE     = false;   // true = nudge only if also snoring (s
 
 // ---------------- Objects & state ----------------
 Adafruit_MPU6050 mpu;
-MAX30105 ppg;
 DHT dht(PIN_DHT, DHT11);
 
 enum Posture { UPRIGHT, SUPINE, PRONE, LEFT_SIDE, RIGHT_SIDE };
@@ -73,6 +72,35 @@ int nudges = 0, nudgeSuccess = 0, escalations = 0, snoreEvents = 0;
 int32_t lastSpo2 = -1, lastHR = -1, minSpo2 = 100;
 float lastTemp = NAN, lastHum = NAN;
 bool ppgOk = false;
+
+// ---- minimal MAX30102 driver (direct I2C, no library) ----
+const uint8_t MAX_ADDR = 0x57;
+void maxWrite(uint8_t reg, uint8_t val) { Wire.beginTransmission(MAX_ADDR); Wire.write(reg); Wire.write(val); Wire.endTransmission(); }
+uint8_t maxRead(uint8_t reg) {
+  Wire.beginTransmission(MAX_ADDR); Wire.write(reg); Wire.endTransmission(false);
+  Wire.requestFrom(MAX_ADDR, (uint8_t)1); return Wire.available() ? Wire.read() : 0;
+}
+bool maxBegin() {
+  if (maxRead(0xFF) != 0x15) return false;      // PART_ID of MAX30102 / MAX30105
+  maxWrite(0x09, 0x40); delay(100);             // reset
+  maxWrite(0x08, 0x5F);                         // FIFO: average 4 samples, rollover on
+  maxWrite(0x0A, 0x2F);                         // SpO2: ADC 4096 nA, 100 samples/s, 411 us pulse (18-bit)
+  maxWrite(0x0C, 0x3C); maxWrite(0x0D, 0x3C);   // LED currents: red, IR (~12 mA)
+  maxWrite(0x04, 0); maxWrite(0x05, 0); maxWrite(0x06, 0);   // clear FIFO pointers
+  maxWrite(0x09, 0x03);                         // SpO2 mode (red + IR)
+  return true;
+}
+// reads one red/IR sample pair from the FIFO; returns false if none is waiting
+bool maxReadSample(uint32_t& red, uint32_t& ir) {
+  uint8_t wr = maxRead(0x04), rd = maxRead(0x06);
+  if (wr == rd) return false;
+  Wire.beginTransmission(MAX_ADDR); Wire.write(0x07); Wire.endTransmission(false);
+  Wire.requestFrom(MAX_ADDR, (uint8_t)6);
+  uint8_t b[6]; for (int i = 0; i < 6; i++) b[i] = Wire.available() ? Wire.read() : 0;
+  red = (((uint32_t)b[0] << 16) | ((uint32_t)b[1] << 8) | b[2]) & 0x3FFFF;
+  ir  = (((uint32_t)b[3] << 16) | ((uint32_t)b[4] << 8) | b[5]) & 0x3FFFF;
+  return true;
+}
 
 // ---------------- Helpers ----------------
 void setMotor(int duty) { ledcWrite(PIN_MOTOR, duty); }
@@ -224,10 +252,10 @@ void readPPG() {
   if (!ppgOk) return;
   const int N = 100;
   static uint32_t ir[N], red[N];
+  maxWrite(0x04, 0); maxWrite(0x05, 0); maxWrite(0x06, 0);   // drop stale FIFO data, start a fresh 4 s window
   for (int i = 0; i < N; i++) {
     unsigned long t0 = millis();
-    while (!ppg.available()) { ppg.check(); if (millis() - t0 > 200) return; }
-    red[i] = ppg.getRed(); ir[i] = ppg.getIR(); ppg.nextSample();
+    while (!maxReadSample(red[i], ir[i])) { delay(2); if (millis() - t0 > 200) return; }
   }
   if (ir[N - 1] < 50000) { Serial.println("[PPG] no finger detected"); return; }
   int32_t spo2, hr; int8_t vs, vh;
@@ -336,8 +364,8 @@ void setup() {
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
     Serial.println("[I2C ] MPU6050 found @0x68");
   } else Serial.println("[I2C ] MPU6050 NOT found – check SDA/SCL");
-  ppgOk = ppg.begin(Wire, I2C_SPEED_FAST);
-  if (ppgOk) { ppg.setup(60, 4, 2, 100, 411, 4096); Serial.println("[I2C ] MAX30102 found @0x57"); }
+  ppgOk = maxBegin();
+  if (ppgOk) Serial.println("[I2C ] MAX30102 found @0x57");
   else Serial.println("[I2C ] MAX30102 NOT found");
   dht.begin();
   wifiConnect(10000);
