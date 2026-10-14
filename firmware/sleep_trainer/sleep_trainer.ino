@@ -7,7 +7,7 @@
  * Cloud     : Firebase Realtime Database over HTTPS (REST)
  *
  * Board package: esp32 by Espressif, 2.x or 3.x (both supported)
- * Libraries    : Adafruit MPU6050, Adafruit Unified Sensor, DHT sensor library
+ * Libraries    : DHT sensor library (MPU6050 and MAX30102 are read directly over I2C)
  *                (MAX30102 is driven directly over I2C – no MAX3010x library needed)
  * Verified    : compiles for "DOIT ESP32 DEVKIT V1" with esp32 core 2.0.17 and 3.3.12
  */
@@ -16,8 +16,6 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <time.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include <DHT.h>
 
 // ---------------- Pin map ----------------
@@ -49,7 +47,6 @@ const int   SNORES_REQUIRED   = 3;       // bursts in last 30 s
 const bool  REQUIRE_SNORE     = false;   // true = nudge only if also snoring (supine alone triggers in demo)
 
 // ---------------- Objects & state ----------------
-Adafruit_MPU6050 mpu;
 DHT dht(PIN_DHT, DHT11);
 
 enum Posture { UPRIGHT, SUPINE, PRONE, LEFT_SIDE, RIGHT_SIDE };
@@ -102,6 +99,41 @@ bool maxReadSample(uint32_t& red, uint32_t& ir) {
   return true;
 }
 
+// ---- minimal MPU6050 driver (direct I2C; also works with MPU6500/9250 clones) ----
+uint8_t mpuAddr = 0x68;
+bool mpuOk = false;
+uint8_t i2cRead8(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr); Wire.write(reg); if (Wire.endTransmission(false) != 0) return 0xFF;
+  Wire.requestFrom(addr, (uint8_t)1); return Wire.available() ? Wire.read() : 0xFF;
+}
+void i2cWrite8(uint8_t addr, uint8_t reg, uint8_t v) { Wire.beginTransmission(addr); Wire.write(reg); Wire.write(v); Wire.endTransmission(); }
+bool mpuBegin() {
+  for (uint8_t a : {0x68, 0x69}) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      mpuAddr = a;
+      uint8_t who = i2cRead8(a, 0x75);
+      i2cWrite8(a, 0x6B, 0x80); delay(100);   // reset
+      i2cWrite8(a, 0x6B, 0x01);               // wake up, PLL clock
+      i2cWrite8(a, 0x1C, 0x00);               // accel range +-2 g (16384 LSB/g)
+      i2cWrite8(a, 0x1A, 0x04);               // low-pass filter ~21 Hz
+      Serial.printf("[I2C ] MPU found @0x%02X (WHO_AM_I=0x%02X)\n", a, who);
+      return true;
+    }
+  }
+  return false;
+}
+bool mpuReadAccel(float& ax, float& ay, float& az) {
+  Wire.beginTransmission(mpuAddr); Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(mpuAddr, (uint8_t)6) != 6) return false;
+  int16_t x = (Wire.read() << 8) | Wire.read();
+  int16_t y = (Wire.read() << 8) | Wire.read();
+  int16_t z = (Wire.read() << 8) | Wire.read();
+  ax = x / 16384.0f; ay = y / 16384.0f; az = z / 16384.0f;
+  return true;
+}
+
 // ---------------- Helpers ----------------
 // PWM works on both ESP32 board package 2.x (channel API) and 3.x (pin API)
 #ifndef ESP_ARDUINO_VERSION_MAJOR
@@ -139,6 +171,10 @@ void ledPattern() {
 bool ntpStarted = false;
 unsigned long lastWifiTry = 0;
 void wifiConnect(unsigned long waitMs = 0) {
+  if (strcmp(WIFI_SSID, "YOUR_WIFI") == 0) {                // Wi-Fi not configured: run offline quietly
+    if (waitMs) Serial.println("[WiFi] not configured – offline mode");
+    return;
+  }
   if (WiFi.status() == WL_CONNECTED) {
     if (!ntpStarted) {
       ntpStarted = true;
@@ -192,10 +228,9 @@ void logEvent(const char* type, const String& detail) {
 
 // ---------------- Sensors ----------------
 Posture readPosture(float& ax, float& ay, float& az) {
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  ax = ay = az = 0;
+  if (!mpuOk || !mpuReadAccel(ax, ay, az)) return posture;   // keep last posture if the sensor is missing
   // Mounting: Z axis points out of the chest, Y axis toward the head.
-  ax = a.acceleration.x / 9.81; ay = a.acceleration.y / 9.81; az = a.acceleration.z / 9.81;
   if (ay > 0.7)  return UPRIGHT;
   if (az > 0.8)  return SUPINE;      // chest facing the ceiling
   if (az < -0.8) return PRONE;
@@ -378,11 +413,11 @@ void setup() {
   pinMode(PIN_LDR, INPUT);                    // HW-072 LDR module: DO is HIGH when dark
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  if (mpu.begin(0x68, &Wire)) {
-    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-    Serial.println("[I2C ] MPU6050 found @0x68");
-  } else Serial.println("[I2C ] MPU6050 NOT found – check SDA/SCL");
+  Serial.print("[I2C ] scan:");
+  for (uint8_t a = 1; a < 127; a++) { Wire.beginTransmission(a); if (Wire.endTransmission() == 0) Serial.printf(" 0x%02X", a); }
+  Serial.println();
+  mpuOk = mpuBegin();
+  if (!mpuOk) Serial.println("[I2C ] MPU6050 NOT found – check SDA/SCL");
   ppgOk = maxBegin();
   if (ppgOk) Serial.println("[I2C ] MAX30102 found @0x57");
   else Serial.println("[I2C ] MAX30102 NOT found");

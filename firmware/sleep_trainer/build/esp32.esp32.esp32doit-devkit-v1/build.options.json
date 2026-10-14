@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "runtime.tools.ctags.path=/tmp/claude-0/actbin,build.warn_data_percentage=75",
+  "fqbn": "esp32:esp32:esp32doit-devkit-v1",
+  "hardwareFolders": "/tmp/claude-0/ard/data/packages",
+  "otherLibrariesFolders": "/tmp/claude-0/ard/user/libraries",
+  "sketchLocation": "/home/claude/spt/firmware/sleep_trainer"
+}
