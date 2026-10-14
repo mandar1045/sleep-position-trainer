@@ -429,8 +429,12 @@ void setup() {
 }
 
 void loop() {
-  bool dark = digitalRead(PIN_LDR) == HIGH;  // digital LDR module
-  int ldr = dark ? 0 : 4095;
+  // digital LDR module, debounced: the state only changes after it has been stable for 1.5 s
+  static bool darkStable = false; static unsigned long ldrChangeSince = 0;
+  bool darkRaw = digitalRead(PIN_LDR) == HIGH;
+  if (darkRaw == darkStable) ldrChangeSince = millis();
+  else if (millis() - ldrChangeSince > 1500) { darkStable = darkRaw; ldrChangeSince = millis(); }
+  int ldr = darkStable ? 0 : 4095;
   int p2p = 0;
   if (sampleSound(p2p)) {                       // ~100 ms, also paces the loop
     snoreTimes[snoreHead] = millis(); snoreHead = (snoreHead + 1) % 16; snoreEvents++;
