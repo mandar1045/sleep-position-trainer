@@ -34,6 +34,7 @@ const char* WIFI_PASS     = "YOUR_PASSWORD";
 const char* FIREBASE_URL  = "https://YOUR-PROJECT-default-rtdb.firebaseio.com";
 const char* FIREBASE_AUTH = "YOUR_DATABASE_SECRET";
 const char* DEVICE_ID     = "spt01";
+const bool  USE_MAX30102  = false;   // heart-rate / SpO2 sensor removed from the board
 
 const int   LDR_DARK          = 800;     // ADC below this = room dark
 const int   LDR_BRIGHT        = 2000;    // ADC above this = lights on
@@ -418,8 +419,9 @@ void setup() {
   Serial.println();
   mpuOk = mpuBegin();
   if (!mpuOk) Serial.println("[I2C ] MPU6050 NOT found – check SDA/SCL");
-  ppgOk = maxBegin();
-  if (ppgOk) Serial.println("[I2C ] MAX30102 found @0x57");
+  ppgOk = USE_MAX30102 && maxBegin();
+  if (!USE_MAX30102) Serial.println("[I2C ] MAX30102 disabled");
+  else if (ppgOk) Serial.println("[I2C ] MAX30102 found @0x57");
   else Serial.println("[I2C ] MAX30102 NOT found");
   dht.begin();
   wifiConnect(10000);
@@ -469,8 +471,8 @@ void loop() {
     static uint8_t ppgTick = 0;
     if (!nudging && (ppgTick++ % 3 == 0)) readPPG();   // ~4 s blocking read, every 3rd upload, skipped while nudging
     readEnv();
-    Serial.printf("[STAT] pos=%s ax=%.2f ay=%.2f az=%.2f sound=%d snores=%d ldr=%d T=%.1f RH=%.0f HR=%ld SpO2=%ld\n",
-                  POSTURE_NAME[posture], ax, ay, az, p2p, recentSnores(), ldr, lastTemp, lastHum, (long)lastHR, (long)lastSpo2);
+    Serial.printf("[STAT] pos=%s ax=%.2f ay=%.2f az=%.2f sound=%d snores=%d light=%s T=%.1f RH=%.0f\n",
+                  POSTURE_NAME[posture], ax, ay, az, p2p, recentSnores(), ldr < LDR_DARK ? "DARK" : "LIT", lastTemp, lastHum);
     wifiConnect();
     uploadLive(ax, ay, az, p2p, ldr);
   }
