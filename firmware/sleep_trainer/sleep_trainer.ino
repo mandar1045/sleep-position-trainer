@@ -48,8 +48,6 @@ const unsigned long MORNING_MS        = 10UL * 60 * 1000; // lights on this long
 const int   SNORE_P2P_LEVEL   = 1500;    // peak-to-peak ADC counts in 100 ms window
 const int   SNORES_REQUIRED   = 3;       // bursts in last 30 s
 const bool  REQUIRE_SNORE     = false;   // true = nudge only if also snoring (supine alone triggers in demo)
-const int   MOTOR_MIN_DUTY    = 102;     // 40 % of 255
-const int   MOTOR_MAX_DUTY    = 178;     // 70 % of 255
 
 // ---------------- Objects & state ----------------
 Adafruit_MPU6050 mpu;
@@ -65,6 +63,7 @@ Posture posture = UPRIGHT, candidate = UPRIGHT;
 unsigned long candidateSince = 0, modeSince = 0, lastUpload = 0, brightSince = 0;
 unsigned long nudgeStart = 0;
 bool nudging = false, buzzing = false;
+int nudgeLevel = -1;                 // current vibration level (0..2)
 
 unsigned long snoreTimes[16]; int snoreHead = 0;
 int loudFrames = 0;
@@ -205,7 +204,7 @@ void readEnv() {
 
 // ---------------- Actuator logic ----------------
 void startNudge() {
-  nudging = true; buzzing = false; nudgeStart = millis(); nudges++;
+  nudging = true; buzzing = false; nudgeStart = millis(); nudges++; nudgeLevel = -1;
   Serial.println("[ACT ] nudge start");
   logEvent("nudge", POSTURE_NAME[posture]);
 }
@@ -222,14 +221,26 @@ void stopNudge(bool success) {
   }
 }
 
+// Vibration gets clearly stronger in 3 levels before the buzzer joins in:
+//   level 1: 35 % PWM, short 250 ms pulses   (gentle tap)
+//   level 2: 65 % PWM, 500 ms pulses         (stronger)
+//   level 3: 100 % PWM, 800 ms pulses        (full) – and the buzzer starts after ESCALATE_MS
+const int  LEVEL_DUTY[3]  = {90, 165, 255};
+const int  LEVEL_PULSE[3] = {250, 500, 800};        // ms ON out of every 1000 ms
+
+
 void updateNudge() {
   if (!nudging) return;
   unsigned long dt = millis() - nudgeStart;
-  // vibration: 600 ms on / 400 ms off, intensity ramps from 40 % to 70 % over 20 s
-  int duty = map(min(dt, 20000UL), 0, 20000, MOTOR_MIN_DUTY, MOTOR_MAX_DUTY);
-  setMotor((dt % 1000) < 600 ? duty : 0);
+  int level = min(2, (int)(dt * 3 / ESCALATE_MS));   // splits the time before the buzzer into 3 equal steps
+  if (level != nudgeLevel) {
+    nudgeLevel = level;
+    Serial.printf("[ACT ] vibration level %d: PWM %d/255 (%d %%), pulse %d ms\n",
+                  level + 1, LEVEL_DUTY[level], LEVEL_DUTY[level] * 100 / 255, LEVEL_PULSE[level]);
+  }
+  setMotor((dt % 1000) < (unsigned long)LEVEL_PULSE[level] ? LEVEL_DUTY[level] : 0);
   if (dt > ESCALATE_MS) {
-    if (!buzzing) { buzzing = true; escalations++; Serial.println("[ACT ] ignored 30 s – buzzer"); logEvent("escalate", "buzzer"); }
+    if (!buzzing) { buzzing = true; escalations++; Serial.println("[ACT ] nudge ignored – buzzer ON"); logEvent("escalate", "buzzer"); }
     digitalWrite(PIN_BUZZER, (dt % 1500) < 200);        // short beep every 1.5 s
   }
   if (dt > 120000UL) stopNudge(false);                    // safety: give up after 2 min
