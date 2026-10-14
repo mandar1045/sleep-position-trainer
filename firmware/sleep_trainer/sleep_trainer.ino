@@ -8,6 +8,7 @@
  *
  * Board package: esp32 by Espressif, core 3.x  (uses ledcAttach / ledcWrite(pin, duty))
  * Libraries    : Adafruit MPU6050, Adafruit Unified Sensor, SparkFun MAX3010x, DHT sensor library
+ * Verified    : compiles for "DOIT ESP32 DEVKIT V1" with esp32 core 3.3.12 (83% flash)
  */
 #include <Wire.h>
 #include <WiFi.h>
@@ -46,7 +47,7 @@ const unsigned long UPLOAD_MS         = 5UL * 1000;       // DEMO (real: 60 s)  
 const unsigned long MORNING_MS        = 10UL * 60 * 1000; // lights on this long = morning
 const int   SNORE_P2P_LEVEL   = 1500;    // peak-to-peak ADC counts in 100 ms window
 const int   SNORES_REQUIRED   = 3;       // bursts in last 30 s
-const bool  REQUIRE_SNORE     = true;    // false = nudge on any supine posture
+const bool  REQUIRE_SNORE     = false;   // true = nudge only if also snoring (supine alone triggers in demo)
 const int   MOTOR_MIN_DUTY    = 102;     // 40 % of 255
 const int   MOTOR_MAX_DUTY    = 178;     // 70 % of 255
 
@@ -88,18 +89,27 @@ void ledPattern() {
   digitalWrite(PIN_LED, on);
 }
 
-void wifiConnect() {
-  if (WiFi.status() == WL_CONNECTED) return;
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(250);
+// waitMs > 0: block up to waitMs (used once in setup). waitMs = 0: non-blocking retry every 30 s,
+// so the motor / buzzer keep working normally even when Wi-Fi is unavailable.
+bool ntpStarted = false;
+unsigned long lastWifiTry = 0;
+void wifiConnect(unsigned long waitMs = 0) {
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[WiFi] Connected: %s  RSSI %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    configTime(19800, 0, "pool.ntp.org", "time.google.com");   // IST = UTC+5:30
-  } else {
-    Serial.println("[WiFi] not connected – data kept locally");
+    if (!ntpStarted) {
+      ntpStarted = true;
+      Serial.printf("[WiFi] Connected: %s  RSSI %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      configTime(19800, 0, "pool.ntp.org", "time.google.com");   // IST = UTC+5:30
+    }
+    return;
   }
+  if (waitMs == 0 && millis() - lastWifiTry < 30000) return;
+  lastWifiTry = millis();
+  if (waitMs) { WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS); }
+  else WiFi.reconnect();
+  unsigned long t0 = millis();
+  while (waitMs && WiFi.status() != WL_CONNECTED && millis() - t0 < waitMs) delay(250);
+  if (WiFi.status() == WL_CONNECTED) wifiConnect();            // prints + starts NTP
+  else Serial.println(waitMs ? "[WiFi] not connected – running offline, will keep retrying" : "[WiFi] retrying...");
 }
 
 String isoTime() {
@@ -278,7 +288,7 @@ void setup() {
   if (ppgOk) { ppg.setup(60, 4, 2, 100, 411, 4096); Serial.println("[I2C ] MAX30102 found @0x57"); }
   else Serial.println("[I2C ] MAX30102 NOT found");
   dht.begin();
-  wifiConnect();
+  wifiConnect(10000);
   modeSince = millis(); lastStatTick = millis();
 }
 
