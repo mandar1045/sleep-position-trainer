@@ -1,0 +1,333 @@
+/*
+ * Sleep Position Trainer – ESP32 DevKit V1
+ * Team: Mandar Joshi (24BIT0595), Animesh Abhi Dubey (24BIT0057)
+ *
+ * Sensors   : S1 MPU6050 (I2C), S2 MAX30102 (I2C), S3 KY-038 (A0), S4 DHT11, S5 LDR module HW-072 (digital DO)
+ * Actuators : A1 coin vibration motor (2N2222A, PWM), A2 active buzzer (2N2222A), A3 status LED
+ * Cloud     : Firebase Realtime Database over HTTPS (REST)
+ *
+ * Board package: esp32 by Espressif, core 3.x  (uses ledcAttach / ledcWrite(pin, duty))
+ * Libraries    : Adafruit MPU6050, Adafruit Unified Sensor, SparkFun MAX3010x, DHT sensor library
+ */
+#include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include <DHT.h>
+
+// ---------------- Pin map ----------------
+#define PIN_SDA      21
+#define PIN_SCL      22
+#define PIN_SOUND    34   // KY-038 A0  (ADC1)
+#define PIN_LDR      35   // HW-072 LDR module DO (HIGH = dark)
+#define PIN_DHT       4
+#define PIN_MOTOR    25   // 2N2222A #1 base via 1k (PWM)
+#define PIN_BUZZER   26   // 2N2222A #2 base via 1k
+#define PIN_LED      27   // LED via 220R
+
+// ---------------- Configuration ----------------
+const char* WIFI_SSID     = "YOUR_WIFI";
+const char* WIFI_PASS     = "YOUR_PASSWORD";
+const char* FIREBASE_URL  = "https://YOUR-PROJECT-default-rtdb.firebaseio.com";
+const char* FIREBASE_AUTH = "YOUR_DATABASE_SECRET";
+const char* DEVICE_ID     = "spt01";
+
+const int   LDR_DARK          = 800;     // ADC below this = room dark
+const int   LDR_BRIGHT        = 2000;    // ADC above this = lights on
+const unsigned long START_DELAY_MS   = 10UL * 1000;       // DEMO (real: 15 min)  // fall-asleep delay
+const unsigned long SUPINE_CONFIRM_MS = 3UL * 1000;      // DEMO (real: 20 s)      // stable posture time
+const unsigned long ESCALATE_MS       = 10UL * 1000;      // DEMO (real: 30 s)      // buzzer if ignored
+const unsigned long UPLOAD_MS         = 5UL * 1000;       // DEMO (real: 60 s)      // cloud update period
+const unsigned long MORNING_MS        = 10UL * 60 * 1000; // lights on this long = morning
+const int   SNORE_P2P_LEVEL   = 1500;    // peak-to-peak ADC counts in 100 ms window
+const int   SNORES_REQUIRED   = 3;       // bursts in last 30 s
+const bool  REQUIRE_SNORE     = true;    // false = nudge on any supine posture
+const int   MOTOR_MIN_DUTY    = 102;     // 40 % of 255
+const int   MOTOR_MAX_DUTY    = 178;     // 70 % of 255
+
+// ---------------- Objects & state ----------------
+Adafruit_MPU6050 mpu;
+MAX30105 ppg;
+DHT dht(PIN_DHT, DHT11);
+
+enum Posture { UPRIGHT, SUPINE, PRONE, LEFT_SIDE, RIGHT_SIDE };
+const char* POSTURE_NAME[] = {"UPRIGHT", "SUPINE", "PRONE", "LEFT", "RIGHT"};
+enum Mode { WAIT_DARK, START_DELAY, MONITOR };
+
+Mode mode = WAIT_DARK;
+Posture posture = UPRIGHT, candidate = UPRIGHT;
+unsigned long candidateSince = 0, modeSince = 0, lastUpload = 0, brightSince = 0;
+unsigned long nudgeStart = 0;
+bool nudging = false, buzzing = false;
+
+unsigned long snoreTimes[16]; int snoreHead = 0;
+int loudFrames = 0;
+
+// night statistics
+unsigned long supineMs = 0, lastStatTick = 0;
+int nudges = 0, nudgeSuccess = 0, escalations = 0, snoreEvents = 0;
+int32_t lastSpo2 = -1, lastHR = -1, minSpo2 = 100;
+float lastTemp = NAN, lastHum = NAN;
+bool ppgOk = false;
+
+// ---------------- Helpers ----------------
+void setMotor(int duty) { ledcWrite(PIN_MOTOR, duty); }
+
+void ledPattern() {
+  unsigned long t = millis();
+  bool on;
+  if (mode == WAIT_DARK)        on = false;
+  else if (mode == START_DELAY) on = (t / 1000) % 2;          // slow blink
+  else if (nudging)             on = (t / 125) % 2;           // fast blink
+  else                          on = (t % 4000) < 80;         // heartbeat flash
+  digitalWrite(PIN_LED, on);
+}
+
+void wifiConnect() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(250);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WiFi] Connected: %s  RSSI %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    configTime(19800, 0, "pool.ntp.org", "time.google.com");   // IST = UTC+5:30
+  } else {
+    Serial.println("[WiFi] not connected – data kept locally");
+  }
+}
+
+String isoTime() {
+  struct tm ti;
+  if (!getLocalTime(&ti, 50)) return String(millis() / 1000);
+  char b[25]; strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%S", &ti);
+  return String(b);
+}
+
+String dateKey() {
+  struct tm ti;
+  if (!getLocalTime(&ti, 50)) return "unknown";
+  char b[12]; strftime(b, sizeof b, "%Y-%m-%d", &ti);
+  return String(b);
+}
+
+bool firebaseSend(const String& path, const String& json, bool push) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http;
+  String url = String(FIREBASE_URL) + path + ".json?auth=" + FIREBASE_AUTH;
+  if (!http.begin(client, url)) return false;
+  http.addHeader("Content-Type", "application/json");
+  unsigned long t0 = millis();
+  int code = push ? http.POST(json) : http.PUT(json);
+  Serial.printf("[HTTP] %s %s -> %d (%lu ms)\n", push ? "POST" : "PUT", path.c_str(), code, millis() - t0);
+  http.end();
+  return code == 200;
+}
+
+void logEvent(const char* type, const String& detail) {
+  String j = "{\"t\":\"" + isoTime() + "\",\"type\":\"" + type + "\",\"detail\":\"" + detail + "\"}";
+  firebaseSend(String("/devices/") + DEVICE_ID + "/events", j, true);
+}
+
+// ---------------- Sensors ----------------
+Posture readPosture(float& ax, float& ay, float& az) {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  // Mounting: Z axis points out of the chest, Y axis toward the head.
+  ax = a.acceleration.x / 9.81; ay = a.acceleration.y / 9.81; az = a.acceleration.z / 9.81;
+  if (ay > 0.7)  return UPRIGHT;
+  if (az > 0.8)  return SUPINE;      // chest facing the ceiling
+  if (az < -0.8) return PRONE;
+  return (ax > 0) ? LEFT_SIDE : RIGHT_SIDE;
+}
+
+// one 100 ms window of the microphone: returns true when a snore burst ends
+bool sampleSound(int& p2p) {
+  int lo = 4095, hi = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 100) {
+    int v = analogRead(PIN_SOUND);
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+    delayMicroseconds(500);
+  }
+  p2p = hi - lo;
+  if (p2p > SNORE_P2P_LEVEL) { loudFrames++; return false; }
+  bool burst = (loudFrames >= 3 && loudFrames <= 25);   // 0.3 s – 2.5 s of loud sound
+  loudFrames = 0;
+  return burst;
+}
+
+int recentSnores() {
+  int n = 0; unsigned long now = millis();
+  for (int i = 0; i < 16; i++) if (snoreTimes[i] && now - snoreTimes[i] < 30000) n++;
+  return n;
+}
+
+void readPPG() {
+  if (!ppgOk) return;
+  const int N = 100;
+  static uint32_t ir[N], red[N];
+  for (int i = 0; i < N; i++) {
+    unsigned long t0 = millis();
+    while (!ppg.available()) { ppg.check(); if (millis() - t0 > 200) return; }
+    red[i] = ppg.getRed(); ir[i] = ppg.getIR(); ppg.nextSample();
+  }
+  if (ir[N - 1] < 50000) { Serial.println("[PPG] no finger detected"); return; }
+  int32_t spo2, hr; int8_t vs, vh;
+  maxim_heart_rate_and_oxygen_saturation(ir, N, red, &spo2, &vs, &hr, &vh);
+  if (vs) { lastSpo2 = spo2; if (spo2 < minSpo2) minSpo2 = spo2; }
+  if (vh) lastHR = hr;
+  if (vs && spo2 < 90) logEvent("spo2_dip", String(spo2) + "%");
+}
+
+void readEnv() {
+  float t = dht.readTemperature(), h = dht.readHumidity();
+  if (!isnan(t)) lastTemp = t;
+  if (!isnan(h)) lastHum = h;
+}
+
+// ---------------- Actuator logic ----------------
+void startNudge() {
+  nudging = true; buzzing = false; nudgeStart = millis(); nudges++;
+  Serial.println("[ACT ] nudge start");
+  logEvent("nudge", POSTURE_NAME[posture]);
+}
+
+void stopNudge(bool success) {
+  if (!nudging) return;
+  nudging = false; buzzing = false;
+  setMotor(0); digitalWrite(PIN_BUZZER, LOW);
+  if (success) {
+    nudgeSuccess++;
+    unsigned long s = (millis() - nudgeStart) / 1000;
+    Serial.printf("[ACT ] turned to %s in %lu s – motor OFF\n", POSTURE_NAME[posture], s);
+    logEvent("turned", String(POSTURE_NAME[posture]) + " in " + s + " s");
+  }
+}
+
+void updateNudge() {
+  if (!nudging) return;
+  unsigned long dt = millis() - nudgeStart;
+  // vibration: 600 ms on / 400 ms off, intensity ramps from 40 % to 70 % over 20 s
+  int duty = map(min(dt, 20000UL), 0, 20000, MOTOR_MIN_DUTY, MOTOR_MAX_DUTY);
+  setMotor((dt % 1000) < 600 ? duty : 0);
+  if (dt > ESCALATE_MS) {
+    if (!buzzing) { buzzing = true; escalations++; Serial.println("[ACT ] ignored 30 s – buzzer"); logEvent("escalate", "buzzer"); }
+    digitalWrite(PIN_BUZZER, (dt % 1500) < 200);        // short beep every 1.5 s
+  }
+  if (dt > 120000UL) stopNudge(false);                    // safety: give up after 2 min
+}
+
+// ---------------- Cloud ----------------
+void uploadLive(float ax, float ay, float az, int p2p, int ldr) {
+  char j[480];
+  snprintf(j, sizeof j,
+    "{\"t\":\"%s\",\"mode\":%d,\"posture\":\"%s\",\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
+    "\"sound\":%d,\"snores30s\":%d,\"light\":%d,\"temp\":%.1f,\"hum\":%.0f,\"hr\":%ld,\"spo2\":%ld,"
+    "\"supineMin\":%lu,\"nudges\":%d,\"success\":%d,\"nudging\":%d,\"buzzing\":%d}",
+    isoTime().c_str(), mode, POSTURE_NAME[posture], ax, ay, az, p2p, recentSnores(), ldr,
+    lastTemp, lastHum, (long)lastHR, (long)lastSpo2, supineMs / 60000, nudges, nudgeSuccess, nudging, buzzing);
+  firebaseSend(String("/devices/") + DEVICE_ID + "/live", j, false);
+
+  // compact history point every 6th upload (~30 s) for the dashboard charts
+  static uint8_t histTick = 0;
+  if (histTick++ % 6 == 0) {
+    char h[200];
+    snprintf(h, sizeof h, "{\"t\":\"%s\",\"posture\":\"%s\",\"hr\":%ld,\"spo2\":%ld,\"sound\":%d,\"snores30s\":%d,\"temp\":%.1f,\"hum\":%.0f}",
+             isoTime().c_str(), POSTURE_NAME[posture], (long)lastHR, (long)lastSpo2, p2p, recentSnores(), lastTemp, lastHum);
+    firebaseSend(String("/devices/") + DEVICE_ID + "/history", h, true);
+  }
+}
+
+void uploadNight() {
+  char j[300];
+  snprintf(j, sizeof j,
+    "{\"supineMin\":%lu,\"nudges\":%d,\"success\":%d,\"escalations\":%d,\"snoreEvents\":%d,"
+    "\"minSpo2\":%ld,\"lastHR\":%ld,\"temp\":%.1f,\"hum\":%.0f}",
+    supineMs / 60000, nudges, nudgeSuccess, escalations, snoreEvents, (long)minSpo2, (long)lastHR, lastTemp, lastHum);
+  firebaseSend(String("/devices/") + DEVICE_ID + "/nights/" + dateKey(), j, false);
+  supineMs = 0; nudges = nudgeSuccess = escalations = snoreEvents = 0; minSpo2 = 100;
+}
+
+// ---------------- Setup / loop ----------------
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n[BOOT] Sleep Position Trainer v0.9 (ESP32 DevKit V1)");
+  pinMode(PIN_LED, OUTPUT); pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  ledcAttach(PIN_MOTOR, 200, 8);   // 200 Hz, 8-bit PWM
+  setMotor(0);
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_SOUND, ADC_11db);
+  pinMode(PIN_LDR, INPUT);                    // HW-072 LDR module: DO is HIGH when dark
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+  if (mpu.begin(0x68, &Wire)) {
+    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("[I2C ] MPU6050 found @0x68");
+  } else Serial.println("[I2C ] MPU6050 NOT found – check SDA/SCL");
+  ppgOk = ppg.begin(Wire, I2C_SPEED_FAST);
+  if (ppgOk) { ppg.setup(60, 4, 2, 100, 411, 4096); Serial.println("[I2C ] MAX30102 found @0x57"); }
+  else Serial.println("[I2C ] MAX30102 NOT found");
+  dht.begin();
+  wifiConnect();
+  modeSince = millis(); lastStatTick = millis();
+}
+
+void loop() {
+  bool dark = digitalRead(PIN_LDR) == HIGH;  // digital LDR module
+  int ldr = dark ? 0 : 4095;
+  int p2p = 0;
+  if (sampleSound(p2p)) {                       // ~100 ms, also paces the loop
+    snoreTimes[snoreHead] = millis(); snoreHead = (snoreHead + 1) % 16; snoreEvents++;
+  }
+  float ax, ay, az;
+  Posture p = readPosture(ax, ay, az);
+  if (p != candidate) { candidate = p; candidateSince = millis(); }
+  if (millis() - candidateSince > SUPINE_CONFIRM_MS || (nudging && p != SUPINE)) posture = candidate;
+
+  unsigned long now = millis();
+  switch (mode) {
+    case WAIT_DARK:
+      if (ldr < LDR_DARK) { mode = START_DELAY; modeSince = now; Serial.println("[LDR ] dark -> start-up delay"); }
+      break;
+    case START_DELAY:
+      if (ldr > LDR_BRIGHT) { mode = WAIT_DARK; break; }
+      if (now - modeSince > START_DELAY_MS) { mode = MONITOR; Serial.println("[MODE] monitoring"); }
+      break;
+    case MONITOR: {
+      if (posture == SUPINE) supineMs += now - lastStatTick;
+      bool snoring = recentSnores() >= SNORES_REQUIRED;
+      if (!nudging && posture == SUPINE && (snoring || !REQUIRE_SNORE)) startNudge();
+      if (nudging && posture != SUPINE) stopNudge(true);
+      updateNudge();
+      if (ldr > LDR_BRIGHT) { if (!brightSince) brightSince = now; }
+      else brightSince = 0;
+      if (brightSince && now - brightSince > MORNING_MS) {   // morning: send summary
+        stopNudge(false); uploadNight(); mode = WAIT_DARK; brightSince = 0;
+      }
+      break;
+    }
+  }
+  lastStatTick = now;
+  ledPattern();
+
+  if (now - lastUpload > UPLOAD_MS) {
+    lastUpload = now;
+    static uint8_t ppgTick = 0;
+    if (!nudging && (ppgTick++ % 3 == 0)) readPPG();   // ~4 s blocking read, every 3rd upload, skipped while nudging
+    readEnv();
+    Serial.printf("[STAT] pos=%s ax=%.2f ay=%.2f az=%.2f sound=%d snores=%d ldr=%d T=%.1f RH=%.0f HR=%ld SpO2=%ld\n",
+                  POSTURE_NAME[posture], ax, ay, az, p2p, recentSnores(), ldr, lastTemp, lastHum, (long)lastHR, (long)lastSpo2);
+    wifiConnect();
+    uploadLive(ax, ay, az, p2p, ldr);
+  }
+}

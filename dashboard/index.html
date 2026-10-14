@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sleep Position Trainer</title>
+  <meta name="description" content="Live IoT dashboard for the ESP32 Sleep Position Trainer – posture, vitals, snoring and nightly therapy reports.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M20 4a12 12 0 1 0 8 20A10 10 0 0 1 20 4z' fill='%238fb4ff'/%3E%3C/svg%3E">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg class="moon" viewBox="0 0 32 32" aria-hidden="true"><path d="M20 4a12 12 0 1 0 8 20A10 10 0 0 1 20 4z"/></svg>
+    <div>
+      <h1>Sleep Position Trainer</h1>
+      <p class="sub">ESP32 · MPU6050 · MAX30102 · KY-038 · LDR · DHT11 &nbsp;→&nbsp; Firebase</p>
+    </div>
+  </div>
+  <div class="top-right">
+    <span id="conn" class="pill pill-wait"><i></i><span>Connecting…</span></span>
+    <button id="btnSettings" class="btn ghost" aria-label="Settings">Settings</button>
+  </div>
+</header>
+
+<main>
+  <!-- Row 1: posture + therapy state -->
+  <section class="grid hero">
+    <article class="card posture-card">
+      <div class="card-h"><h2>Body position</h2><span id="postureSince" class="muted small"></span></div>
+      <div class="posture-wrap">
+        <svg id="postureSvg" viewBox="-110 -110 220 220" aria-label="Body position">
+          <circle r="96" class="ring"/>
+          <text y="-100" class="dir" text-anchor="middle">CEILING</text>
+          <text y="110" class="dir" text-anchor="middle">BED</text>
+          <line x1="-104" y1="70" x2="104" y2="70" class="bed"/>
+          <g id="torso">
+            <ellipse rx="58" ry="38" class="torso"/>
+            <circle cx="0" cy="0" r="10" class="spine"/>
+            <path d="M0 -38 L0 -78" class="chest"/>
+            <path d="M-9 -68 L0 -82 L9 -68" class="chest-head"/>
+            <text y="-52" x="10" class="chest-l">chest</text>
+          </g>
+        </svg>
+        <div class="posture-info">
+          <div id="postureName" class="big">—</div>
+          <div id="postureHint" class="muted">Waiting for data</div>
+          <div class="axes">
+            <div class="axis"><span>ax</span><div class="bar"><b id="axB"></b></div><code id="axV">0.00</code></div>
+            <div class="axis"><span>ay</span><div class="bar"><b id="ayB"></b></div><code id="ayV">0.00</code></div>
+            <div class="axis"><span>az</span><div class="bar"><b id="azB"></b></div><code id="azV">0.00</code></div>
+          </div>
+          <p class="muted small">Supine when <code>az &gt; 0.8 g</code> (gravity through the chest).</p>
+        </div>
+      </div>
+    </article>
+
+    <article class="card state-card">
+      <div class="card-h"><h2>Therapy state</h2><span id="lastSeen" class="muted small"></span></div>
+      <ol class="modes" id="modes">
+        <li data-m="0"><b>1</b><div><strong>Wait for dark</strong><span>LDR detects lights off</span></div></li>
+        <li data-m="1"><b>2</b><div><strong>Fall-asleep delay</strong><span>No alerts yet</span></div></li>
+        <li data-m="2"><b>3</b><div><strong>Monitoring</strong><span>Posture + snore watch</span></div></li>
+      </ol>
+      <div id="actuators" class="actuators">
+        <div class="act" id="actMotor"><span class="dot"></span>Vibration motor</div>
+        <div class="act" id="actBuzzer"><span class="dot"></span>Buzzer</div>
+        <div class="act" id="actLed"><span class="dot"></span>Status LED</div>
+      </div>
+      <div class="tonight">
+        <div><span class="num" id="nNudges">0</span><span class="lbl">nudges tonight</span></div>
+        <div><span class="num" id="nSuccess">—</span><span class="lbl">turned after nudge</span></div>
+        <div><span class="num" id="nSupine">0</span><span class="lbl">min on back</span></div>
+      </div>
+    </article>
+  </section>
+
+  <!-- Row 2: vitals -->
+  <section class="grid tiles" id="tiles">
+    <article class="tile"><span class="t-l">Heart rate</span><span class="t-v"><b id="vHR">—</b><small>bpm</small></span><span class="t-s" id="sHR">MAX30102</span></article>
+    <article class="tile"><span class="t-l">SpO₂</span><span class="t-v"><b id="vSpO2">—</b><small>%</small></span><span class="t-s" id="sSpO2">MAX30102</span></article>
+    <article class="tile"><span class="t-l">Snores (30 s)</span><span class="t-v"><b id="vSnore">—</b><small>bursts</small></span><span class="t-s" id="sSnore">KY-038</span></article>
+    <article class="tile"><span class="t-l">Room light</span><span class="t-v"><b id="vLight">—</b></span><span class="t-s">LDR module</span></article>
+    <article class="tile"><span class="t-l">Temperature</span><span class="t-v"><b id="vTemp">—</b><small>°C</small></span><span class="t-s">DHT11</span></article>
+    <article class="tile"><span class="t-l">Humidity</span><span class="t-v"><b id="vHum">—</b><small>%</small></span><span class="t-s">DHT11</span></article>
+  </section>
+
+  <!-- Row 3: charts -->
+  <section class="grid charts">
+    <article class="card"><div class="card-h"><h2>Heart rate</h2><span class="muted small">bpm</span></div><div class="chart"><canvas id="cHR"></canvas></div></article>
+    <article class="card"><div class="card-h"><h2>Blood oxygen (SpO₂)</h2><span class="muted small">% · dashed line = 90 % alert</span></div><div class="chart"><canvas id="cSpO2"></canvas></div></article>
+    <article class="card"><div class="card-h"><h2>Sound level</h2><span class="muted small">microphone peak-to-peak (ADC)</span></div><div class="chart"><canvas id="cSound"></canvas></div></article>
+    <article class="card"><div class="card-h"><h2>Position timeline</h2><span class="muted small" id="tlRange"></span></div>
+      <div id="timeline" class="timeline"></div>
+      <div class="legend" id="tlLegend"></div>
+      <div class="tl-stats" id="tlStats"></div>
+    </article>
+  </section>
+
+  <!-- Row 4: events + nights -->
+  <section class="grid bottom">
+    <article class="card">
+      <div class="card-h"><h2>Event log</h2><span class="muted small" id="evCount"></span></div>
+      <ul id="events" class="events"><li class="muted">No events yet</li></ul>
+    </article>
+    <article class="card">
+      <div class="card-h"><h2>Nightly reports</h2>
+        <div class="seg" role="tablist"><button class="on" data-v="chart">Chart</button><button data-v="table">Table</button></div>
+      </div>
+      <div id="nightsChart" class="chart tall"><canvas id="cNights"></canvas></div>
+      <div id="nightsTable" class="table-wrap" hidden></div>
+    </article>
+  </section>
+
+  <footer class="foot">
+    Mandar Joshi (24BIT0595) · Animesh Abhi Dubey (24BIT0057) · Embedded Systems and IoT
+    <span id="srcInfo" class="muted"></span>
+  </footer>
+</main>
+
+<dialog id="dlg">
+  <form method="dialog">
+    <h3>Connect to Firebase</h3>
+    <label>Realtime Database URL<input id="inDb" placeholder="https://your-project-default-rtdb.firebaseio.com"></label>
+    <label>Device ID<input id="inDev" placeholder="spt01"></label>
+    <p class="muted small">Saved in this browser only. Leave the URL empty to use demo data.</p>
+    <div class="row">
+      <button value="demo" class="btn ghost">Use demo data</button>
+      <button value="save" class="btn">Connect</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

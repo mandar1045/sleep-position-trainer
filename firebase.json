@@ -1,0 +1,8 @@
+{
+  "database": { "rules": "backend/database.rules.json" },
+  "hosting": {
+    "public": "dashboard",
+    "ignore": ["firebase.json", "**/.*"],
+    "headers": [{ "source": "**/*.@(js|css)", "headers": [{ "key": "Cache-Control", "value": "max-age=300" }] }]
+  }
+}
