@@ -6,10 +6,10 @@
  * Actuators : A1 coin vibration motor (2N2222A, PWM), A2 active buzzer (2N2222A), A3 status LED
  * Cloud     : Firebase Realtime Database over HTTPS (REST)
  *
- * Board package: esp32 by Espressif, core 3.x  (uses ledcAttach / ledcWrite(pin, duty))
+ * Board package: esp32 by Espressif, 2.x or 3.x (both supported)
  * Libraries    : Adafruit MPU6050, Adafruit Unified Sensor, DHT sensor library
  *                (MAX30102 is driven directly over I2C – no MAX3010x library needed)
- * Verified    : compiles for "DOIT ESP32 DEVKIT V1" with esp32 core 3.3.12 (83% flash)
+ * Verified    : compiles for "DOIT ESP32 DEVKIT V1" with esp32 core 2.0.17 and 3.3.12
  */
 #include <Wire.h>
 #include <WiFi.h>
@@ -103,7 +103,26 @@ bool maxReadSample(uint32_t& red, uint32_t& ir) {
 }
 
 // ---------------- Helpers ----------------
-void setMotor(int duty) { ledcWrite(PIN_MOTOR, duty); }
+// PWM works on both ESP32 board package 2.x (channel API) and 3.x (pin API)
+#ifndef ESP_ARDUINO_VERSION_MAJOR
+#define ESP_ARDUINO_VERSION_MAJOR 2
+#endif
+const int MOTOR_CH = 0;
+void motorPwmInit() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_MOTOR, 200, 8);          // 200 Hz, 8-bit
+#else
+  ledcSetup(MOTOR_CH, 200, 8);
+  ledcAttachPin(PIN_MOTOR, MOTOR_CH);
+#endif
+}
+void setMotor(int duty) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(PIN_MOTOR, duty);
+#else
+  ledcWrite(MOTOR_CH, duty);
+#endif
+}
 
 void ledPattern() {
   unsigned long t = millis();
@@ -352,7 +371,7 @@ void setup() {
   Serial.println("\n[BOOT] Sleep Position Trainer v0.9 (ESP32 DevKit V1)");
   pinMode(PIN_LED, OUTPUT); pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, LOW);
-  ledcAttach(PIN_MOTOR, 200, 8);   // 200 Hz, 8-bit PWM
+  motorPwmInit();                  // 200 Hz, 8-bit PWM
   setMotor(0);
   analogReadResolution(12);
   analogSetPinAttenuation(PIN_SOUND, ADC_11db);
