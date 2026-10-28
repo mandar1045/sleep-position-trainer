@@ -34,7 +34,7 @@ const char* WIFI_PASS     = "YOUR_PASSWORD";
 const char* FIREBASE_URL  = "https://YOUR-PROJECT-default-rtdb.firebaseio.com";
 const char* FIREBASE_AUTH = "YOUR_DATABASE_SECRET";
 const char* DEVICE_ID     = "spt01";
-const bool  USE_MAX30102  = false;   // heart-rate / SpO2 sensor removed from the board
+const bool  USE_MAX30102  = true;    // set false if the MAX30102 is not fitted
 
 const int   LDR_DARK          = 800;     // ADC below this = room dark
 const int   LDR_BRIGHT        = 2000;    // ADC above this = lights on
@@ -404,7 +404,7 @@ void uploadNight() {
 // ---------------- Setup / loop ----------------
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n[BOOT] Sleep Position Trainer v0.9 (ESP32 DevKit V1)");
+  Serial.println("\n[BOOT] Sleep Position Trainer v1.0 (ESP32 DevKit V1)");
   pinMode(PIN_LED, OUTPUT); pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, LOW);
   motorPwmInit();                  // 200 Hz, 8-bit PWM
@@ -475,8 +475,9 @@ void loop() {
     static uint8_t ppgTick = 0;
     if (!nudging && (ppgTick++ % 3 == 0)) readPPG();   // ~4 s blocking read, every 3rd upload, skipped while nudging
     readEnv();
-    Serial.printf("[STAT] pos=%s ax=%.2f ay=%.2f az=%.2f sound=%d snores=%d light=%s T=%.1f RH=%.0f\n",
-                  POSTURE_NAME[posture], ax, ay, az, p2p, recentSnores(), ldr < LDR_DARK ? "DARK" : "LIT", lastTemp, lastHum);
+    Serial.printf("[STAT] pos=%s ax=%.2f ay=%.2f az=%.2f sound=%d snores=%d light=%s T=%.1f RH=%.0f HR=%ld SpO2=%ld\n",
+                  POSTURE_NAME[posture], ax, ay, az, p2p, recentSnores(), ldr < LDR_DARK ? "DARK" : "LIT", lastTemp, lastHum,
+                  (long)lastHR, (long)lastSpo2);
     wifiConnect();
     uploadLive(ax, ay, az, p2p, ldr);
   }
